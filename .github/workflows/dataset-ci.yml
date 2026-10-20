@@ -1,0 +1,91 @@
+# Shared dataset CI, called from the datasets repo:
+#   jobs: { ci: { uses: octo-ds-sandbox/octo-ds-ci/.github/workflows/dataset-ci.yml@main } }
+# The check code is inlined from octo-ds src/octo_ds/checks.py (keep the two in sync by hand),
+# because the caller's token can't read this private repo.
+name: dataset-ci
+on:
+  workflow_call:
+    inputs:
+      ui_base:
+        type: string
+        default: http://localhost:3000
+permissions:
+  contents: read
+  statuses: write
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: false
+      - name: dataset-diff status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }} \
+            -f state=success -f context=dataset-diff -f description="Open the id-keyed diff" \
+            -f target_url="${{ inputs.ui_base }}/pr/${{ github.event.pull_request.number }}"
+      - name: checks
+        run: |
+          cat > /tmp/checks.py <<'PY'
+          """Dataset CI checks: one .jsonl per top-level folder, rows keyed by `id`."""
+          import json, subprocess
+
+          SCHEMA = {"id": str, "question": str, "answer": str, "_reason": str}  # required
+          OPTIONAL = {"_deleted": bool, "retrieved_chunks": list}
+
+
+          def rows_at(rev, path):
+              try:
+                  text = subprocess.run(["git", "show", f"{rev}:{path}"], capture_output=True,
+                                        text=True, check=True).stdout
+              except subprocess.CalledProcessError:
+                  return None  # file absent at rev
+              return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+          def jsonl_files(rev):
+              out = subprocess.run(["git", "ls-tree", "-r", "--name-only", rev], capture_output=True,
+                                   text=True, check=True).stdout.split()
+              return [p for p in out if p.count("/") == 1 and p.endswith(".jsonl")]
+
+
+          def schema_errors(row):
+              errs = [f"missing {k}" for k in SCHEMA if k not in row]
+              errs += [f"{k} should be {t.__name__}" for k, t in {**SCHEMA, **OPTIONAL}.items()
+                       if k in row and not isinstance(row[k], t)]
+              return errs
+
+
+          def check(base, head):
+              failures = []
+              for path in sorted(set(jsonl_files(base)) | set(jsonl_files(head))):
+                  new = rows_at(head, path) or []
+                  old = {r["id"]: r for r in rows_at(base, path) or [] if "id" in r}
+                  seen = set()
+                  for r in new:
+                      rid = r.get("id")
+                      for e in schema_errors(r):
+                          failures.append(f"{path} {rid}: schema: {e}")
+                      if rid in seen:
+                          failures.append(f"{path} {rid}: duplicate id")
+                      seen.add(rid)
+                      before = old.get(rid)
+                      changed = before is not None and {k: v for k, v in before.items() if k != "_reason"} \
+                          != {k: v for k, v in r.items() if k != "_reason"}
+                      if changed and before.get("_reason") == r.get("_reason"):
+                          failures.append(f"{path} {rid}: row changed but _reason did not")
+                  for rid in old.keys() - seen:
+                      failures.append(f"{path} {rid}: id dropped (use a tombstone)")
+              return failures
+
+          import sys
+          failures = check(sys.argv[1], sys.argv[2])
+          for f in failures:
+              print(f"::error::{f}")
+          print("ok" if not failures else f"{len(failures)} failure(s)")
+          sys.exit(1 if failures else 0)
+          PY
+          python3 /tmp/checks.py "origin/${{ github.base_ref }}" "${{ github.event.pull_request.head.sha }}"
